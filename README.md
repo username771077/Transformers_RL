@@ -1,5 +1,5 @@
 \documentclass[12pt,a4paper]{article}
-SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS
+
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{lmodern}
