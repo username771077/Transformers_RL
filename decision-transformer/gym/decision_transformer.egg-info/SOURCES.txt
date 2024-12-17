@@ -1,0 +1,8 @@
+LICENSE.md
+README.md
+setup.py
+gym/decision_transformer.egg-info/PKG-INFO
+gym/decision_transformer.egg-info/SOURCES.txt
+gym/decision_transformer.egg-info/dependency_links.txt
+gym/decision_transformer.egg-info/requires.txt
+gym/decision_transformer.egg-info/top_level.txt
