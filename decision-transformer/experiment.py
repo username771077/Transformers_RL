@@ -2,18 +2,14 @@ import gym
 import numpy as np
 import torch
 import wandb
-
-import argparse
-import pickle
 import random
-import sys
+import h5py
 
 from decision_transformer.evaluation.evaluate_episodes import evaluate_episode, evaluate_episode_rtg
 from decision_transformer.models.decision_transformer import DecisionTransformer
 from decision_transformer.models.mlp_bc import MLPBCModel
 from decision_transformer.training.act_trainer import ActTrainer
 from decision_transformer.training.seq_trainer import SequenceTrainer
-
 
 def discount_cumsum(x, gamma):
     discount_cumsum = np.zeros_like(x)
@@ -22,59 +18,69 @@ def discount_cumsum(x, gamma):
         discount_cumsum[t] = x[t] + gamma * discount_cumsum[t+1]
     return discount_cumsum
 
-
-def experiment(
-        exp_prefix,
-        variant,
-):
+def experiment(exp_prefix, variant):
     device = variant.get('device', 'cuda')
     log_to_wandb = variant.get('log_to_wandb', False)
 
-    env_name, dataset = variant['env'], variant['dataset']
+    env_name = variant['env']
+    dataset = variant['dataset']
     model_type = variant['model_type']
     group_name = f'{exp_prefix}-{env_name}-{dataset}'
     exp_prefix = f'{group_name}-{random.randint(int(1e5), int(1e6) - 1)}'
 
-    if env_name == 'hopper':
-        env = gym.make('Hopper-v3')
-        max_ep_len = 1000
-        env_targets = [3600, 1800]  # evaluation conditioning targets
-        scale = 1000.  # normalization for rewards/returns
-    elif env_name == 'halfcheetah':
-        env = gym.make('HalfCheetah-v3')
-        max_ep_len = 1000
-        env_targets = [12000, 6000]
-        scale = 1000.
-    elif env_name == 'walker2d':
-        env = gym.make('Walker2d-v3')
-        max_ep_len = 1000
-        env_targets = [5000, 2500]
-        scale = 1000.
-    elif env_name == 'reacher2d':
-        from decision_transformer.envs.reacher_2d import Reacher2dEnv
-        env = Reacher2dEnv()
-        max_ep_len = 100
-        env_targets = [76, 40]
-        scale = 10.
+    # Atari environments here:
+    if env_name == 'amidar':
+        env = gym.make('ALE/Amidar-v5', render_mode=None)
+        max_ep_len = 10000
+        env_targets = [1000, 500]
+        scale = 1.0
+        data_file = 'ALEAmidar-v5.h5'
+    elif env_name == 'galaxian':
+        env = gym.make('ALE/Galaxian-v5', render_mode=None)
+        max_ep_len = 10000
+        env_targets = [1000, 500]
+        scale = 1.0
+        data_file = 'ALEGalaxian-v5.h5'
+    elif env_name == 'tictactoe3d':
+        env = gym.make('ALE/TicTacToe3D-v5', render_mode=None)
+        max_ep_len = 10000
+        env_targets = [1000, 500]
+        scale = 1.0
+        data_file = 'ALETicTacToe3D-v5.h5'
     else:
-        raise NotImplementedError
+        raise NotImplementedError("Environment not supported")
 
     if model_type == 'bc':
-        env_targets = env_targets[:1]  # since BC ignores target, no need for different evaluations
+        env_targets = env_targets[:1]
 
     state_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
 
-    # load dataset
-    dataset_path = f'data/{env_name}-{dataset}-v2.pkl'
-    with open(dataset_path, 'rb') as f:
-        trajectories = pickle.load(f)
+    dataset_path = f'data/{data_file}'
+    with h5py.File(dataset_path, 'r') as f:
+        obs = f['observations'][:]
+        acts = f['actions'][:]
+        rews = f['rewards'][:]
+        # Check for 'terminals' or 'dones'
+        if 'terminals' in f.keys():
+            dones = f['terminals'][:]
+        else:
+            dones = f['dones'][:]
 
-    # save all path information into separate lists
+    trajectories = []
+    for i in range(obs.shape[0]):
+        traj = {
+            'observations': obs[i],
+            'actions': acts[i],
+            'rewards': rews[i],
+            'terminals': dones[i]
+        }
+        trajectories.append(traj)
+
     mode = variant.get('mode', 'normal')
     states, traj_lens, returns = [], [], []
     for path in trajectories:
-        if mode == 'delayed':  # delayed: all rewards moved to end of trajectory
+        if mode == 'delayed':
             path['rewards'][-1] = path['rewards'].sum()
             path['rewards'][:-1] = 0.
         states.append(path['observations'])
@@ -82,9 +88,8 @@ def experiment(
         returns.append(path['rewards'].sum())
     traj_lens, returns = np.array(traj_lens), np.array(returns)
 
-    # used for input normalization
-    states = np.concatenate(states, axis=0)
-    state_mean, state_std = np.mean(states, axis=0), np.std(states, axis=0) + 1e-6
+    states_concat = np.concatenate(states, axis=0)
+    state_mean, state_std = np.mean(states_concat, axis=0), np.std(states_concat, axis=0) + 1e-6
 
     num_timesteps = sum(traj_lens)
 
@@ -100,7 +105,6 @@ def experiment(
     num_eval_episodes = variant['num_eval_episodes']
     pct_traj = variant.get('pct_traj', 1.)
 
-    # only train on top pct_traj trajectories (for %BC experiment)
     num_timesteps = max(int(pct_traj*num_timesteps), 1)
     sorted_inds = np.argsort(returns)  # lowest to highest
     num_trajectories = 1
@@ -112,7 +116,6 @@ def experiment(
         ind -= 1
     sorted_inds = sorted_inds[-num_trajectories:]
 
-    # used to reweight sampling so we sample according to timesteps instead of trajectories
     p_sample = traj_lens[sorted_inds] / sum(traj_lens[sorted_inds])
 
     def get_batch(batch_size=256, max_len=K):
@@ -120,29 +123,24 @@ def experiment(
             np.arange(num_trajectories),
             size=batch_size,
             replace=True,
-            p=p_sample,  # reweights so we sample according to timesteps
+            p=p_sample,
         )
 
-        s, a, r, d, rtg, timesteps, mask = [], [], [], [], [], [], []
+        s, a, r, d, rtg, timesteps_arr, mask = [], [], [], [], [], [], []
         for i in range(batch_size):
             traj = trajectories[int(sorted_inds[batch_inds[i]])]
             si = random.randint(0, traj['rewards'].shape[0] - 1)
 
-            # get sequences from dataset
             s.append(traj['observations'][si:si + max_len].reshape(1, -1, state_dim))
             a.append(traj['actions'][si:si + max_len].reshape(1, -1, act_dim))
             r.append(traj['rewards'][si:si + max_len].reshape(1, -1, 1))
-            if 'terminals' in traj:
-                d.append(traj['terminals'][si:si + max_len].reshape(1, -1))
-            else:
-                d.append(traj['dones'][si:si + max_len].reshape(1, -1))
-            timesteps.append(np.arange(si, si + s[-1].shape[1]).reshape(1, -1))
-            timesteps[-1][timesteps[-1] >= max_ep_len] = max_ep_len-1  # padding cutoff
+            d.append(traj['terminals'][si:si + max_len].reshape(1, -1))
+            timesteps_arr.append(np.arange(si, si + s[-1].shape[1]).reshape(1, -1))
+            timesteps_arr[-1][timesteps_arr[-1] >= max_ep_len] = max_ep_len-1
             rtg.append(discount_cumsum(traj['rewards'][si:], gamma=1.)[:s[-1].shape[1] + 1].reshape(1, -1, 1))
             if rtg[-1].shape[1] <= s[-1].shape[1]:
                 rtg[-1] = np.concatenate([rtg[-1], np.zeros((1, 1, 1))], axis=1)
 
-            # padding and state + reward normalization
             tlen = s[-1].shape[1]
             s[-1] = np.concatenate([np.zeros((1, max_len - tlen, state_dim)), s[-1]], axis=1)
             s[-1] = (s[-1] - state_mean) / state_std
@@ -150,7 +148,7 @@ def experiment(
             r[-1] = np.concatenate([np.zeros((1, max_len - tlen, 1)), r[-1]], axis=1)
             d[-1] = np.concatenate([np.ones((1, max_len - tlen)) * 2, d[-1]], axis=1)
             rtg[-1] = np.concatenate([np.zeros((1, max_len - tlen, 1)), rtg[-1]], axis=1) / scale
-            timesteps[-1] = np.concatenate([np.zeros((1, max_len - tlen)), timesteps[-1]], axis=1)
+            timesteps_arr[-1] = np.concatenate([np.zeros((1, max_len - tlen)), timesteps_arr[-1]], axis=1)
             mask.append(np.concatenate([np.zeros((1, max_len - tlen)), np.ones((1, tlen))], axis=1))
 
         s = torch.from_numpy(np.concatenate(s, axis=0)).to(dtype=torch.float32, device=device)
@@ -158,10 +156,10 @@ def experiment(
         r = torch.from_numpy(np.concatenate(r, axis=0)).to(dtype=torch.float32, device=device)
         d = torch.from_numpy(np.concatenate(d, axis=0)).to(dtype=torch.long, device=device)
         rtg = torch.from_numpy(np.concatenate(rtg, axis=0)).to(dtype=torch.float32, device=device)
-        timesteps = torch.from_numpy(np.concatenate(timesteps, axis=0)).to(dtype=torch.long, device=device)
-        mask = torch.from_numpy(np.concatenate(mask, axis=0)).to(device=device)
+        timesteps_t = torch.from_numpy(np.concatenate(timesteps_arr, axis=0)).to(dtype=torch.long, device=device)
+        mask_t = torch.from_numpy(np.concatenate(mask, axis=0)).to(device=device)
 
-        return s, a, r, d, rtg, timesteps, mask
+        return s, a, r, d, rtg, timesteps_t, mask_t
 
     def eval_episodes(target_rew):
         def fn(model):
@@ -254,7 +252,7 @@ def experiment(
             loss_fn=lambda s_hat, a_hat, r_hat, s, a, r: torch.mean((a_hat - a)**2),
             eval_fns=[eval_episodes(tar) for tar in env_targets],
         )
-    elif model_type == 'bc':
+    else:
         trainer = ActTrainer(
             model=model,
             optimizer=optimizer,
@@ -272,7 +270,6 @@ def experiment(
             project='decision-transformer',
             config=variant
         )
-        # wandb.watch(model)  # wandb has some bug
 
     for iter in range(variant['max_iters']):
         outputs = trainer.train_iteration(num_steps=variant['num_steps_per_iter'], iter_num=iter+1, print_logs=True)
@@ -280,29 +277,33 @@ def experiment(
             wandb.log(outputs)
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--env', type=str, default='hopper')
-    parser.add_argument('--dataset', type=str, default='medium')  # medium, medium-replay, medium-expert, expert
-    parser.add_argument('--mode', type=str, default='normal')  # normal for standard setting, delayed for sparse
-    parser.add_argument('--K', type=int, default=20)
-    parser.add_argument('--pct_traj', type=float, default=1.)
-    parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--model_type', type=str, default='dt')  # dt for decision transformer, bc for behavior cloning
-    parser.add_argument('--embed_dim', type=int, default=128)
-    parser.add_argument('--n_layer', type=int, default=3)
-    parser.add_argument('--n_head', type=int, default=1)
-    parser.add_argument('--activation_function', type=str, default='relu')
-    parser.add_argument('--dropout', type=float, default=0.1)
-    parser.add_argument('--learning_rate', '-lr', type=float, default=1e-4)
-    parser.add_argument('--weight_decay', '-wd', type=float, default=1e-4)
-    parser.add_argument('--warmup_steps', type=int, default=10000)
-    parser.add_argument('--num_eval_episodes', type=int, default=100)
-    parser.add_argument('--max_iters', type=int, default=10)
-    parser.add_argument('--num_steps_per_iter', type=int, default=10000)
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--log_to_wandb', '-w', type=bool, default=False)
-    
-    args = parser.parse_args()
+if __name__ == '__main__':    
+    variant = {
+        'device': 'cuda',
+        'log_to_wandb': False,
+        'mode': 'normal',
+        'K': 20,
+        'pct_traj': 1.0,
+        'batch_size': 64,
+        'model_type': 'dt',
+        'embed_dim': 128,
+        'n_layer': 3,
+        'n_head': 1,
+        'activation_function': 'relu',
+        'dropout': 0.1,
+        'learning_rate': 1e-4,
+        'weight_decay': 1e-4,
+        'warmup_steps': 10000,
+        'num_eval_episodes': 10,
+        'max_iters': 1,
+        'num_steps_per_iter': 1000,
+        'dataset': 'medium'
+    }
 
-    experiment('gym-experiment', variant=vars(args))
+    
+    envs_to_run = ['amidar', 'galaxian', 'tictactoe3d']
+
+    for env_name in envs_to_run:
+        var_copy = variant.copy()
+        var_copy['env'] = env_name
+        experiment('atari-experiment', var_copy)
